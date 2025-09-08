@@ -1,0 +1,8 @@
+[
+  {
+    "host": "192.168.50.204",
+    "port": 11435,
+    "weight": 1,
+    "max_concurrency": 1
+  }
+]
