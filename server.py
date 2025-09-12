@@ -9,13 +9,24 @@ from fastapi.responses import StreamingResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from collections import OrderedDict
 
+import logging, sys
+logger = logging.getLogger("gateway")
+logger.setLevel(logging.INFO)
+
+# ensure logs go to stdout even under uvicorn
+if not logger.handlers:
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(h)
+logger.propagate = False  # uniknij podwójnego logowania przez root
+
 # Configuration
 API_KEY_REQUIRED = False
 API_KEY_VALUE = ""
 HEALTH_INTERVAL_S = 10
 CB_FAIL_THRESHOLD = 3
 CB_OPEN_SECONDS = 30
-POST_TIMEOUT_S = 120
+POST_TIMEOUT_S = None
 STREAM_TIMEOUT_S = None
 ENABLE_LRU_CACHE = True
 LRU_MAX_ITEMS = 128
@@ -77,7 +88,7 @@ def load_phones_config() -> List[PhoneConfig]:
                         port=int(item.get("port", 11434)),
                         model=item.get("model"),
                         weight=int(item.get("weight", 1)),
-                        max_concurrency=int(item.get("max_concurrency", 1)))
+                        max_concurrency=int(item.get("max_concurrency", 4)))
             for item in raw]
 
 class Metrics:
@@ -134,8 +145,10 @@ class Gateway:
 
     async def _health_loop(self):
         while True:
-            await asyncio.gather(*(self._health_check(p) for p in set(self.rr)))
+            unique = {id(x): x for x in self.rr}.values()
+            await asyncio.gather(*(self._health_check(p) for p in unique))
             await asyncio.sleep(HEALTH_INTERVAL_S)
+
 
     async def _health_check(self, phone: PhoneState):
         now = asyncio.get_event_loop().time()
@@ -144,13 +157,16 @@ class Gateway:
         try:
             url = f"http://{phone.cfg.host}:{phone.cfg.port}/api/tags"
             async with httpx.AsyncClient(timeout=5.0) as client:
+                logger.info("[health] OK %s:%d", phone.cfg.host, phone.cfg.port)
                 r = await client.get(url); r.raise_for_status()
+
             phone.healthy, phone.reason, phone.failures = True, None, 0
         except Exception as e:
             phone.healthy, phone.reason = False, f"health_fail: {e}"
             phone.failures += 1
             if phone.failures >= CB_FAIL_THRESHOLD:
                 phone.open_until = now + CB_OPEN_SECONDS
+                logger.warning("[health] FAIL %s:%d -> %s", phone.cfg.host, phone.cfg.port, e)
 
     async def _next_phone(self) -> PhoneState:
         async with self._rr_lock:
@@ -166,7 +182,7 @@ class Gateway:
         messages = []
         if req.system: messages.append({"role":"system","content":req.system})
         messages.append({"role":"user","content":req.prompt})
-        payload: Dict[str, Any] = {"messages": messages}
+        payload: Dict[str, Any] = {"messages": messages, "stream": False}
         if req.options: payload["options"] = req.options
         if req.model: payload["model"] = req.model
         elif fallback: payload["model"] = fallback
@@ -246,7 +262,7 @@ async def startup():
     cfgs = load_phones_config()
     gateway = Gateway(cfgs)
     await gateway.start()
-    logging.info("Gateway ready with %d weighted entries.", len(gateway.rr))
+    logger.info("Gateway ready with %d weighted entries.", len(gateway.rr))
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -257,6 +273,51 @@ async def shutdown():
 async def metrics():
     text = await gateway.metrics.render_prom()
     return PlainTextResponse(text, media_type="text/plain")
+
+@app.get("/ping")
+async def ping():
+    unique = {id(x): x for x in gateway.rr}.values()
+    out = []
+    for p in unique:
+        url = f"http://{p.cfg.host}:{p.cfg.port}/api/tags"
+        t0 = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(url)
+            out.append({
+                "host": p.cfg.host, "port": p.cfg.port,
+                "ok": r.status_code == 200, "status": r.status_code,
+                "ms": int((time.perf_counter() - t0) * 100)
+            })
+        except Exception as e:
+            out.append({
+                "host": p.cfg.host, "port": p.cfg.port,
+                "ok": False, "error": str(e),
+                "ms": int((time.perf_counter() - t0) * 100)
+            })
+    return {"results": out}
+
+@app.post("/ask_trace")
+async def ask_trace(req: AskRequest, x_api_key: Optional[str] = Header(default=None)):
+    require_api_key(x_api_key)
+    async def _gen():
+        unique = list({id(x): x for x in gateway.rr}.values())
+        yield f"# phones={len(unique)}\n".encode()
+
+        phone = await gateway._next_phone()
+        fallback_model = phone.cfg.model
+        payload = gateway._build_payload(req, fallback_model)
+        yield f"# selected {phone.cfg.host}:{phone.cfg.port} model={payload.get('model')}\n".encode()
+        yield b"# posting to phone (streaming)...\n"
+
+        async for chunk in gateway._stream_chat(phone, payload):
+            # przekazujemy strumień Ollamy 1:1 (JSON-line'y z tokenami)
+            if chunk:
+                yield chunk
+
+        yield b"\n# done\n"
+    return StreamingResponse(_gen(), media_type="text/plain")
+
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
@@ -292,15 +353,29 @@ async def ask(req: AskRequest, x_api_key: Optional[str] = Header(default=None)):
     for _ in range(len(list(unique))):
         phone = await gateway._next_phone()
         payload = gateway._build_payload(req, phone.cfg.model)
+        logger.info(f"[ask] trying phone={phone.cfg.host}:{phone.cfg.port} "
+                f"model={payload.get('model')} healthy={phone.healthy} inflight={phone.inflight}")
         try:
             result = await gateway._post_chat(phone, payload)
+            logger.info(f"[ask] success phone={phone.cfg.host}:{phone.cfg.port}")
             if ENABLE_LRU_CACHE and fallback_phone:
                 k2 = cache_key(req, fallback_phone.cfg.model)
                 await gateway.cache.set(k2, result)
             return result
         except Exception as e:
-            last_error = e; continue
-    raise HTTPException(status_code=503, detail=f"No phones responded: {last_error}")
+            logger.warning(f"[ask] failed phone={phone.cfg.host}:{phone.cfg.port}: {e}")
+            last_error = e
+            continue
+
+
+    states = [{"host": p.cfg.host, "port": p.cfg.port, "healthy": p.healthy, "reason": p.reason,
+               "inflight": p.inflight, "open_until": p.open_until}
+              for p in {id(x): x for x in gateway.rr}.values()]
+    raise HTTPException(
+    status_code=503,
+    detail=f"No phones responded. last_error={last_error!s}; states={states}"
+    )
+
 
 @app.post("/ask_stream")
 async def ask_stream(req: AskRequest, x_api_key: Optional[str] = Header(default=None)):

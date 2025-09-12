@@ -202,6 +202,176 @@ simple data parallelism by replicating the model on each phone.
 host ip address:
 ip -4 addr show wlan0 | awk '/inet / {print $2}' | cut -d/ -f1
 
+Quick start
+
+Prepare each phone
+
+Install Termux from Google Play or F‑Droid.
+
+Run pkg update && pkg upgrade -y.
+
+Clone this repository or download phone_setup.sh and run
+bash phone_setup.sh <model> to install Debian and Ollama and
+pull the model.
+
+Note the phone’s IP address on your Wi‑Fi network (Settings →
+About phone → Status or run ip a in Termux).
+
+ADB alternative: If you connect the phone via USB and forward
+its port 11434 to your computer using adb forward tcp:11434 tcp:11434,
+you can skip the IP step. The phone’s Ollama server becomes
+available on 127.0.0.1:11434 on your laptop. See
+the USB / ADB Mode
+
+section for a detailed walkthrough.
+
+Edit phones.json
+
+Add an entry for each phone: { "host": "192.168.1.50", "port": 11434, "weight": 1, "max_concurrency": 1 }.
+
+Run the gateway
+
+On your laptop or PC, create a virtual environment and install
+dependencies:
+
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+
+Start the server:
+
+uvicorn server:app --host 0.0.0.0 --port 8000
+
+
+To test, send a request via curl:
+
+curl -X POST http://localhost:8000/ask \
+-H "Content-Type: application/json" \
+-d '{"prompt":"Jakie są zalety modeli działających offline?"}'
+
+
+Use the API
+
+/health returns the health of each phone (whether the
+/api/tags endpoint responds, the number of inflight requests,
+etc.).
+
+/metrics exposes Prometheus counters (total requests,
+failures and average latency per phone).
+
+Improvements over the prototype
+
+The original prototype distributed prompts to phones in a simple
+round‑robin manner. This release includes several enhancements:
+
+Weighted scheduling and concurrency limits – each phone entry
+may include a weight and max_concurrency so that more powerful
+devices receive more traffic and slower ones are not overloaded.
+
+Circuit‑breaker – if a phone fails three health checks in a row
+the gateway waits 30 seconds before sending more requests to it.
+
+LRU caching – repeated prompts (with the same system and
+options) return instantly without hitting the phones. The cache
+can be disabled by setting ENABLE_LRU_CACHE = False in
+server.py.
+
+Streaming – /ask_stream returns results as soon as tokens are
+available. This is particularly useful on phones where generating
+a full answer may take several seconds.
+
+Batch requests – you can submit a list of prompts in a single
+call; the gateway will dispatch them concurrently across the fleet.
+
+Notes on model selection
+
+Choosing an appropriate model is critical on mobile. On modern
+Snapdragon 8‑series devices a 7–8 billion parameter model can output
+around 11 tokens per second
+androidauthority.com
+. However,
+performance drops rapidly on older phones: the article
+https://www.androidauthority.com/install-deepseek-android-3521203/
+reports
+that devices with only 6 GB of RAM struggle with 7 B models and
+instead run 3 B models at around 5 tokens per second
+androidauthority.com
+.
+If you plan to run multiple devices, start with a smaller model such
+as phi-2 or qwen2.5-1.5b-instruct. Avoid 14 B models unless your
+phone has at least 16 GB of RAM
+androidauthority.com
+.
+
+Although vLLM provides sophisticated tensor and pipeline parallelism
+for distributed inference across GPUs
+docs.vllm.ai
+, these
+techniques require high‑bandwidth interconnects (e.g. NVLink) and are
+not feasible on consumer smartphones. Instead, this project opts for
+simple data parallelism by replicating the model on each phone.
+
+USB / ADB Mode (recommended for testing and multi‑phone labs)
+
+Wi‑Fi connectivity is not always reliable, and in some environments
+routers block traffic between devices or prevent services in proot
+from binding to 0.0.0.0. A simple workaround is to connect the
+phone to your computer via USB and use ADB port forwarding to access
+its Ollama server. This works whether you run Ollama inside Debian
+with proot‑distro or directly in Termux. The only requirement is
+that curl http://127.0.0.1:11434/api/tags produces a JSON response
+on the phone.
+
+1. Prepare the phone
+
+Ensure the model is installed and the server is running on the phone.
+Check locally:
+
+# inside Debian
+proot-distro login debian -- sh -lc 'ollama list && curl -s http://127.0.0.1:11434/api/tags'
+
+# or directly in Termux
+ollama list && curl -s http://127.0.0.1:11434/api/tags
+
+
+Both commands should return a JSON list of tags/models. If not,
+start the server (ollama serve) and try again. To warm up the
+model and reduce latency on the first request, you can run:
+
+curl -s http://127.0.0.1:11434/api/generate \
+-H "Content-Type: application/json" \
+-d '{"model":"tinyllama","prompt":"","stream":false,"keep_alive":"1h","options":{"num_predict":1}}'
+
+2. Forward a port on the computer
+
+Connect the phone to your computer over USB and run:
+
+adb forward tcp:11434 tcp:11434
+
+
+This maps 127.0.0.1:11434 on your laptop to 127.0.0.1:11434 on the phone. You can test the
+connection from your laptop:
+
+curl http://127.0.0.1:11434/api/tags
+
+
+If you see the same JSON response as on the phone, the tunnel is working.
+
+For multiple phones, forward each device to a different local port (e.g.
+11434, 11435, 11436) using the -s SERIAL option:
+
+# Device serials from `adb devices`
+adb -s SERIAL_A forward tcp:11434 tcp:11434
+adb -s SERIAL_B forward tcp:11435 tcp:11434
+
+
+Then populate phones.json with entries like:
+
+[
+{ "host": "127.0.0.1", "port": 11434, "model": "tinyllama", "weight": 1 },
+{ "host": "127.0.0.1", "port": 11435, "model": "tinyllama", "weight": 1 }
+
 ## License
 
 This code is provided for educational purposes.  Check the
