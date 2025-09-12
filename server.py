@@ -10,7 +10,9 @@ from pydantic import BaseModel, Field
 from collections import OrderedDict
 
 from core.store import DeviceStore
+from core.jobs import JobsEngine
 from routers.devices import router as devices_router
+from routers.jobs import router as jobs_router
 
 # logger
 logger = logging.getLogger("gateway")
@@ -199,14 +201,37 @@ class Gateway:
             logger.warning("[health] FAIL %s:%d -> %s", phone.cfg.host, phone.cfg.port, e)
 
     async def _next_phone(self) -> PhoneState:
+        now = asyncio.get_event_loop().time()
         async with self._rr_lock:
             n = len(self.rr)
+
+            # 1) preferuj zdrowe z wolną przepustowością
             for _ in range(n):
                 st = self.rr[self._rr_idx]
                 self._rr_idx = (self._rr_idx + 1) % n
-                if st.healthy and st.open_until <= asyncio.get_event_loop().time():
+                if (
+                        st.healthy
+                        and st.open_until <= now
+                        and st.inflight < st.cfg.max_concurrency
+                ):
                     return st
+
+            # 2) jeśli wszystkie pełne, wybierz najmniej obciążony zdrowy
+            best = None
+            best_load = 1e9
+            for st in self.rr:
+                if st.healthy and st.open_until <= now:
+                    load = st.inflight / max(1, st.cfg.max_concurrency)
+                    if load < best_load:
+                        best = st
+                        best_load = load
+            if best:
+                return best
+
+        # 3) fallback: cokolwiek, żeby nie walić wyjątku (np. gdy brak healthy)
         return random.choice(self.rr)
+
+
 
     def _build_payload(self, req: AskRequest, fallback: Optional[str]) -> Dict[str, Any]:
         messages = []
@@ -282,9 +307,12 @@ class Gateway:
 app = FastAPI(title="Distributed LLM Mobile Gateway", version="2.0.0")
 gateway: Optional[Gateway] = None
 store: Optional[DeviceStore] = None
+from typing import Optional
+jobs: Optional[JobsEngine] = None
 
 # API
 app.include_router(devices_router)
+app.include_router(jobs_router)
 
 def require_api_key(x_api_key: Optional[str]):
     if API_KEY_REQUIRED and x_api_key != API_KEY_VALUE:
@@ -292,20 +320,30 @@ def require_api_key(x_api_key: Optional[str]):
 
 @app.on_event("startup")
 async def startup():
-    global gateway, store
+    global gateway, store, jobs
     phones_path = Path(__file__).parent / "phones.json"
     store = DeviceStore(phones_path)
     cfgs = load_phones_config()
     gateway = Gateway(cfgs, store=store)
     await gateway.start()
+
+    # Jobs engine – tylu workerów, ile łącznej przepustowości telefonów (min. 1)
+    total_workers = max(1, sum(c.max_concurrency for c in cfgs))
+    jobs = JobsEngine(gateway)
+    await jobs.start(total_workers)
+
     app.state.gateway = gateway
     app.state.store = store
-    logger.info("Gateway ready with %d weighted entries.", len(gateway.rr))
+    app.state.jobs = jobs
+    logger.info("Gateway ready with %d weighted entries. Jobs workers=%d", len(gateway.rr), total_workers)
+
 
 @app.on_event("shutdown")
 async def shutdown():
-    global gateway
+    global gateway, jobs
+    if jobs: await jobs.stop()
     if gateway: await gateway.stop()
+
 
 @app.get("/metrics")
 async def metrics():
