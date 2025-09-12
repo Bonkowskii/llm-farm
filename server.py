@@ -1,4 +1,4 @@
-import asyncio, json, logging, random, time, contextlib, hashlib
+import asyncio, json, logging, random, time, contextlib, hashlib, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Any, AsyncIterator
@@ -9,16 +9,17 @@ from fastapi.responses import StreamingResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from collections import OrderedDict
 
-import logging, sys
+from core.store import DeviceStore
+from routers.devices import router as devices_router
+
+# logger
 logger = logging.getLogger("gateway")
 logger.setLevel(logging.INFO)
-
-# ensure logs go to stdout even under uvicorn
 if not logger.handlers:
     h = logging.StreamHandler(sys.stdout)
     h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     logger.addHandler(h)
-logger.propagate = False  # uniknij podwójnego logowania przez root
+logger.propagate = False
 
 # Configuration
 API_KEY_REQUIRED = False
@@ -72,6 +73,7 @@ class PhoneConfig:
     host: str; port: int = 11434
     model: Optional[str] = None; weight: int = 1
     max_concurrency: int = 1
+    serial: Optional[str] = None
 
 @dataclass
 class PhoneState:
@@ -88,7 +90,8 @@ def load_phones_config() -> List[PhoneConfig]:
                         port=int(item.get("port", 11434)),
                         model=item.get("model"),
                         weight=int(item.get("weight", 1)),
-                        max_concurrency=int(item.get("max_concurrency", 4)))
+                        max_concurrency=int(item.get("max_concurrency", 1)),
+                        serial=item.get("serial"))
             for item in raw]
 
 class Metrics:
@@ -124,7 +127,7 @@ class Metrics:
             return "\n".join(lines) + "\n"
 
 class Gateway:
-    def __init__(self, cfgs: List[PhoneConfig]):
+    def __init__(self, cfgs: List[PhoneConfig], store: Optional[DeviceStore] = None):
         weighted: List[PhoneState] = []
         for cfg in cfgs:
             st = PhoneState(cfg=cfg)
@@ -134,6 +137,10 @@ class Gateway:
         self._hc_task: Optional[asyncio.Task] = None
         self.metrics = Metrics()
         self.cache = LRUCache(LRU_MAX_ITEMS) if ENABLE_LRU_CACHE else None
+        self.store = store
+
+    def _devkey(self, cfg: PhoneConfig) -> str:
+        return cfg.serial or f"{cfg.host}:{cfg.port}"
 
     async def start(self):
         self._hc_task = asyncio.create_task(self._health_loop())
@@ -147,26 +154,49 @@ class Gateway:
         while True:
             unique = {id(x): x for x in self.rr}.values()
             await asyncio.gather(*(self._health_check(p) for p in unique))
+            if self.store:
+                self.store.flush_if_dirty()
             await asyncio.sleep(HEALTH_INTERVAL_S)
-
 
     async def _health_check(self, phone: PhoneState):
         now = asyncio.get_event_loop().time()
+        key = self._devkey(phone.cfg)
         if phone.open_until > now:
-            phone.healthy, phone.reason = False, "circuit_open"; return
+            phone.healthy, phone.reason = False, "circuit_open"
+            if self.store:
+                self.store.update_dynamic(key, {
+                    "healthy": False, "reason": "circuit_open",
+                    "inflight": phone.inflight, "open_until": phone.open_until
+                })
+            return
         try:
             url = f"http://{phone.cfg.host}:{phone.cfg.port}/api/tags"
             async with httpx.AsyncClient(timeout=5.0) as client:
-                logger.info("[health] OK %s:%d", phone.cfg.host, phone.cfg.port)
-                r = await client.get(url); r.raise_for_status()
-
+                r = await client.get(url)
+                r.raise_for_status()
+                data = r.json()
+            models = [m.get("name") for m in (data.get("models") or []) if m.get("name")]
             phone.healthy, phone.reason, phone.failures = True, None, 0
+            if self.store:
+                self.store.update_dynamic(key, {
+                    "healthy": True, "reason": None,
+                    "inflight": phone.inflight, "open_until": phone.open_until,
+                    "models": sorted(set(models)),
+                })
+                self.store.mark_ok(key)
+            logger.info("[health] OK %s:%d", phone.cfg.host, phone.cfg.port)
         except Exception as e:
             phone.healthy, phone.reason = False, f"health_fail: {e}"
             phone.failures += 1
             if phone.failures >= CB_FAIL_THRESHOLD:
                 phone.open_until = now + CB_OPEN_SECONDS
-                logger.warning("[health] FAIL %s:%d -> %s", phone.cfg.host, phone.cfg.port, e)
+            if self.store:
+                self.store.update_dynamic(key, {
+                    "healthy": False, "reason": str(e),
+                    "inflight": phone.inflight, "open_until": phone.open_until,
+                })
+                self.store.mark_error(key)
+            logger.warning("[health] FAIL %s:%d -> %s", phone.cfg.host, phone.cfg.port, e)
 
     async def _next_phone(self) -> PhoneState:
         async with self._rr_lock:
@@ -251,6 +281,10 @@ class Gateway:
 
 app = FastAPI(title="Distributed LLM Mobile Gateway", version="2.0.0")
 gateway: Optional[Gateway] = None
+store: Optional[DeviceStore] = None
+
+# API
+app.include_router(devices_router)
 
 def require_api_key(x_api_key: Optional[str]):
     if API_KEY_REQUIRED and x_api_key != API_KEY_VALUE:
@@ -258,10 +292,14 @@ def require_api_key(x_api_key: Optional[str]):
 
 @app.on_event("startup")
 async def startup():
-    global gateway
+    global gateway, store
+    phones_path = Path(__file__).parent / "phones.json"
+    store = DeviceStore(phones_path)
     cfgs = load_phones_config()
-    gateway = Gateway(cfgs)
+    gateway = Gateway(cfgs, store=store)
     await gateway.start()
+    app.state.gateway = gateway
+    app.state.store = store
     logger.info("Gateway ready with %d weighted entries.", len(gateway.rr))
 
 @app.on_event("shutdown")
@@ -287,13 +325,13 @@ async def ping():
             out.append({
                 "host": p.cfg.host, "port": p.cfg.port,
                 "ok": r.status_code == 200, "status": r.status_code,
-                "ms": int((time.perf_counter() - t0) * 100)
+                "ms": int((time.perf_counter() - t0) * 1000)
             })
         except Exception as e:
             out.append({
                 "host": p.cfg.host, "port": p.cfg.port,
                 "ok": False, "error": str(e),
-                "ms": int((time.perf_counter() - t0) * 100)
+                "ms": int((time.perf_counter() - t0) * 1000)
             })
     return {"results": out}
 
@@ -303,21 +341,16 @@ async def ask_trace(req: AskRequest, x_api_key: Optional[str] = Header(default=N
     async def _gen():
         unique = list({id(x): x for x in gateway.rr}.values())
         yield f"# phones={len(unique)}\n".encode()
-
         phone = await gateway._next_phone()
         fallback_model = phone.cfg.model
         payload = gateway._build_payload(req, fallback_model)
         yield f"# selected {phone.cfg.host}:{phone.cfg.port} model={payload.get('model')}\n".encode()
         yield b"# posting to phone (streaming)...\n"
-
         async for chunk in gateway._stream_chat(phone, payload):
-            # przekazujemy strumień Ollamy 1:1 (JSON-line'y z tokenami)
             if chunk:
                 yield chunk
-
         yield b"\n# done\n"
     return StreamingResponse(_gen(), media_type="text/plain")
-
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
@@ -354,7 +387,7 @@ async def ask(req: AskRequest, x_api_key: Optional[str] = Header(default=None)):
         phone = await gateway._next_phone()
         payload = gateway._build_payload(req, phone.cfg.model)
         logger.info(f"[ask] trying phone={phone.cfg.host}:{phone.cfg.port} "
-                f"model={payload.get('model')} healthy={phone.healthy} inflight={phone.inflight}")
+                    f"model={payload.get('model')} healthy={phone.healthy} inflight={phone.inflight}")
         try:
             result = await gateway._post_chat(phone, payload)
             logger.info(f"[ask] success phone={phone.cfg.host}:{phone.cfg.port}")
@@ -367,15 +400,13 @@ async def ask(req: AskRequest, x_api_key: Optional[str] = Header(default=None)):
             last_error = e
             continue
 
-
     states = [{"host": p.cfg.host, "port": p.cfg.port, "healthy": p.healthy, "reason": p.reason,
                "inflight": p.inflight, "open_until": p.open_until}
               for p in {id(x): x for x in gateway.rr}.values()]
     raise HTTPException(
-    status_code=503,
-    detail=f"No phones responded. last_error={last_error!s}; states={states}"
+        status_code=503,
+        detail=f"No phones responded. last_error={last_error!s}; states={states}"
     )
-
 
 @app.post("/ask_stream")
 async def ask_stream(req: AskRequest, x_api_key: Optional[str] = Header(default=None)):
